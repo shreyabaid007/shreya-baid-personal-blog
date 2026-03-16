@@ -1,0 +1,60 @@
+---
+title: "Attention Is Not All You Need"
+description: "The transformer paper made a bold claim. Seven years later, it's worth being precise about what attention actually does — and what it doesn't."
+date: "2024-11-15"
+tags: ["transformers", "attention", "ML theory"]
+draft: false
+---
+
+The 2017 paper *Attention Is All You Need* introduced the transformer and, with a slight excess of marketing confidence, suggested that attention mechanisms were sufficient for sequence modelling. The claim aged remarkably well in some respects and poorly in others.
+
+This is my attempt to be precise about what attention actually does, why it works so well, and where the title overpromises.
+
+## What attention is, mechanically
+
+At its core, self-attention is a weighted averaging operation. For each position in a sequence, you compute a weighted sum of the values at all other positions, where the weights are determined by the similarity between queries and keys.
+
+```python
+def attention(Q, K, V):
+    d_k = Q.shape[-1]
+    scores = Q @ K.T / math.sqrt(d_k)  # scale to prevent vanishing gradients
+    weights = softmax(scores, dim=-1)
+    return weights @ V
+```
+
+That's it. The sophistication is in what Q, K, and V are trained to represent — not in the operation itself.
+
+## What it does well
+
+**Long-range dependencies.** RNNs pass information through a chain of hidden states. Every step is a bottleneck. Attention connects any two positions in O(1) operations, regardless of distance. For tasks where context at position 1 matters for a decision at position 512, this matters enormously.
+
+**Parallelisation.** RNNs are sequential by nature — you can't compute hidden state *t* before hidden state *t-1*. Attention over a full sequence is a matrix multiplication, which hardware accelerators do very efficiently in parallel. This is why transformers scaled — training speed, not just quality.
+
+**Interpretability (to a degree).** You can visualise attention weights. They're not always meaningful, but the machinery to inspect them exists. RNN hidden states are notoriously opaque.
+
+## What it doesn't do
+
+**It doesn't understand position.** Attention is permutation-equivariant. If you shuffle the input tokens, you get shuffled outputs — the same information, reordered. You have to add positional encodings by hand. The original paper used fixed sinusoidal encodings. RoPE and ALiBi are more recent attempts to solve this less hackily.
+
+**It doesn't handle arbitrary-length sequences cheaply.** Self-attention is O(n²) in sequence length. This is fine for sentences. It's a problem for entire documents, codebases, or genome sequences. The field has been working on this since roughly 2019, with varying success.
+
+**It doesn't replace inductive biases.** Convolutions encode spatial locality. Attention doesn't — you can't easily tell a transformer "nearby tokens probably matter more than distant ones." For tasks where that prior is correct (most vision tasks, for instance), convolutions are hard to beat on efficiency grounds even today.
+
+## The actual claim, accurately stated
+
+Transformers are an excellent general-purpose architecture for sequence modelling when:
+- You have enough data to learn structure from scratch
+- You have hardware that can exploit parallelism
+- Sequence lengths are manageable
+
+They're not magic. They're a well-engineered combination of existing ideas — attention mechanisms (which predate the paper), residual connections (He et al., 2015), layer normalisation, and multi-head projections.
+
+The claim in the title was good marketing. The actual contribution was demonstrating that you could remove recurrence entirely — not that attention was sufficient for all sequence tasks. That's a more precise and more interesting claim.
+
+## Where this leaves us
+
+Modern LLMs are not just transformers. They're transformers plus enormous training datasets, plus careful instruction tuning, plus RLHF or DPO alignment stages. The architecture is the least interesting part of what makes GPT-4 or Claude different from previous generation models.
+
+The lesson is not "transformers are magic." The lesson is that architecture matters less than we thought, and data and scale matter more. That's both liberating (you don't need a clever architecture to do something useful) and concerning (the advantages accrue primarily to those with resources to build and curate large datasets).
+
+That asymmetry is worth sitting with.

@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --paper: #F9F8F5;
+  --paper-warm: #F4F2ED;
+  --paper-border: #E4E2DC;
+  --ink: #18181B;
+  --ink-soft: #3F3F46;
+  --ink-muted: #71717A;
+  --ink-faint: #A1A1AA;
+  --forest: #0F4C35;
+  --forest-light: #1A6B4A;
+  --forest-pale: #E8F3EE;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--paper);
+  color: var(--ink-soft);
+}
+
+/* Heading selections use Playfair */
+h1, h2, h3, h4 {
+  font-family: var(--font-playfair);
+  color: var(--ink);
+}
+
+/* Refined selection color */
+::selection {
+  background-color: #D4E9DD;
+  color: var(--ink);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--paper); }
+::-webkit-scrollbar-thumb { background: var(--paper-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); }
+
+/* Divider style */
+.divider {
+  border: none;
+  border-top: 1px solid var(--paper-border);
+  margin: 2rem 0;
+}
+
+/* Prose code block overrides — shiki handles syntax, this handles chrome */
+.prose pre {
+  background: #1C1C1E !important;
+  border: 1px solid #2C2C2E;
+}
+
+.prose pre code {
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: 0.875rem;
+}
+
+/* Inline code */
+.prose :not(pre) > code {
+  background: var(--paper-warm) !important;
+  border: 1px solid var(--paper-border) !important;
+  color: var(--ink) !important;
+  padding: 0.15em 0.4em !important;
+  border-radius: 3px !important;
+  font-size: 0.875em !important;
+}
+
+/* Post title animation */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fadeUp 0.4s ease-out both;
+}
+
+.animate-fade-up-delay-1 { animation-delay: 0.05s; }
+.animate-fade-up-delay-2 { animation-delay: 0.1s; }
+.animate-fade-up-delay-3 { animation-delay: 0.15s; }
+.animate-fade-up-delay-4 { animation-delay: 0.2s; }
+.animate-fade-up-delay-5 { animation-delay: 0.25s; }
+
+/* Post list hover underline animation */
+.post-link {
+  text-decoration: none;
+  background-image: linear-gradient(to right, var(--forest), var(--forest));
+  background-size: 0% 1px;
+  background-repeat: no-repeat;
+  background-position: 0 100%;
+  transition: background-size 0.25s ease;
+  padding-bottom: 1px;
+}
+
+.post-link:hover {
+  background-size: 100% 1px;
+}
+
+/* Category tag */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2em 0.65em;
+  border-radius: 2px;
+  font-size: 0.75rem;
+  font-family: var(--font-jetbrains);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 400;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
