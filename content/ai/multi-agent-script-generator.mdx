@@ -1,0 +1,440 @@
+---
+title: "Building a Multi-Agent Pipeline with Parallel Orchestration and Sandbox Execution"
+description: "A multi-agent system that takes a plain-English data request and delivers a tested, documented, sandboxed Python script."
+date: "2025-10-27"
+tags: ["LLM", "Agentic AI", "Multimodal", "LangGraph"]
+draft: false
+---
+
+## 1. Problem & Context
+
+### What Problem Does This Project Solve?
+
+Data engineers, analysts, and backend teams spend a disproportionate amount of time writing boilerplate data transformation scripts — code that reads a CSV, reshapes a few columns, validates types, and writes output. The logic is rarely complex, but every script still needs the same scaffolding: a schema contract, test coverage, and documentation. Nobody writes the tests first. The README gets skipped. The schema is undocumented. The next person who touches the pipeline has to reverse-engineer the intent from the code.
+
+The multi-agent-script-generator addresses this directly: given a plain-English description (or a screenshot of a data schema), it produces a complete, tested, documented, and sandboxed Python script — all in one automated pipeline.
+
+The deliverable is not just code. It is a `FileBundle` containing:
+
+- `transform.py` — the Polars transformation script
+- `test_transform.py` — a pytest suite validating the transformation
+- `README.md` — generated documentation explaining the pipeline
+
+All of this is verified in a Docker sandbox before it reaches the user.
+
+### Why Is This Important in Today's AI Landscape?
+
+The first wave of LLM applications was prompt-in, text-out. The second wave is task-in, verified artifact-out. The difference is execution: an LLM that generates code and an LLM pipeline that generates, tests, and validates code are not the same product.
+
+This project sits squarely in the second wave. It treats the LLM not as a chat interface but as a component in a deterministic workflow, where outputs are structured, executable, and verified before delivery. That shift — from generation to generation-plus-validation — is what makes agentic AI systems useful in production contexts rather than demo contexts.
+
+This pattern is increasingly relevant to anyone building internal tooling, data platform automation, developer productivity infrastructure, or AI-augmented workflows. The script generator is a narrow instantiation, but the architecture generalizes.
+
+### Who Faces This Problem?
+
+- **Data engineers** who maintain dozens of transformation scripts with inconsistent patterns and no test coverage.
+- **Platform teams** building self-service tools for analysts who cannot write Python.
+- **CTOs and architects** evaluating whether multi-agent LLM systems can produce artifacts (code, configs, specs) that are reliable enough to go into production with minimal human review.
+- **AI engineers** who need a reference implementation for LangGraph's parallel fan-out, HITL interrupts, and structured output — not a toy, but a coherent production-ready pattern.
+
+---
+
+## 2. Core Concepts
+
+### Agentic Pipelines vs. Chains
+
+A chain is a fixed sequence of LLM calls. An agentic pipeline adds routing logic, parallelism, state, and the ability to loop — all controlled by a runtime rather than hard-coded Python.
+
+In this system, LangGraph acts as the runtime. It manages a `StateGraph` where each node is either an LLM call or a computation, edges define control flow, and state is shared across nodes with explicit merge semantics.
+
+### The Send API and Parallel Fan-Out
+
+LangGraph's `Send` API allows a single node to dispatch multiple downstream tasks simultaneously. Each `Send` creates an independent execution branch carrying a copy of the current state. All branches converge at a downstream merge node. This is not async Python concurrency — it is graph-level parallelism managed by the LangGraph scheduler.
+
+```python
+def dispatch_agents(state: AgentState) -> list[Send]:
+    return [
+        Send("schema_agent", state),
+        Send("code_agent", state),
+        Send("test_agent", state),
+        Send("docs_agent", state),
+    ]
+```
+
+Total latency becomes `max(agent_latencies)` rather than their sum. This matters because the four specialist agents are independent — none of them depends on the output of the others.
+
+### Annotated Reducers for Concurrent State Writes
+
+When four agents write to the same state object concurrently, the default last-writer-wins behavior drops three of the four outputs. LangGraph solves this via Python's `Annotated` type hint combined with a reducer function:
+
+```python
+agent_outputs: Annotated[list[dict], operator.add]
+```
+
+Each agent appends to this list rather than overwriting it. After all four complete, a merge node unpacks the list by `agent_type` discriminator into the typed fields the rest of the pipeline expects.
+
+### Human-in-the-Loop (HITL) with `interrupt()`
+
+LangGraph's `interrupt()` call suspends graph execution at a checkpoint, serializes state to the checkpointer, and returns control to the caller. Execution resumes when the API receives a `/resume` call with an approval decision. This is the correct pattern for any pipeline where the LLM output should not be delivered automatically — code, infrastructure configs, emails, financial actions.
+
+### Model Tiering
+
+Not all LLM tasks require the same model. Structured, mechanical tasks (test generation, schema inference, documentation) have predictable outputs and benefit from smaller, faster, cheaper models. Complex reasoning tasks (code generation, orchestration, vision parsing) justify a more capable model.
+
+This system uses Claude Sonnet for the orchestrator, vision, and code agents; Haiku for schema, test, and docs agents. Three of five agents run on Haiku — substantial cost savings without quality loss on deterministic tasks.
+
+### Sandboxed Execution via Docker SDK
+
+LLM-generated code should never run directly on the host. The sandbox in this system uses the Docker Python SDK (`client.containers.run()`) with `network_mode="none"`, `mem_limit`, `cpu_quota`, and `pids_limit` set per execution. Each run gets an ephemeral temp directory as a volume mount. The container is removed after the run regardless of outcome. This is the same model used by production code execution services.
+
+---
+
+## 3. System Design & Architecture
+
+### End-to-End Pipeline
+
+```
+User Input (text or image)
+        │
+        ▼
+ ┌─────────────┐
+ │route_after_ │  ── image? ──► Vision Agent (Sonnet)
+ │   input     │                       │
+ └─────────────┘                       ▼
+        │                    Orchestrator Agent (Sonnet)
+        └─────────────────────────────►│
+                                       │ Send API (parallel)
+              ┌────────────────────────┼────────────────────┐
+              ▼            ▼           ▼          ▼
+        Schema Agent  Code Agent  Test Agent  Docs Agent
+          (Haiku)      (Sonnet)    (Haiku)     (Haiku)
+              │            │           │          │
+              └────────────┴───────────┴──────────┘
+                                       │
+                               Annotated reducer
+                                   (merge)
+                                       │
+                                    Assemble
+                                  (FileBundle)
+                                       │
+                              Sandbox Executor
+                               (Docker SDK)
+                                       │
+                      ┌────────────────┴──────────────┐
+                      │ success                        │ failure
+                      ▼                                ▼
+               Review (interrupt)             Code Fix Agent
+               HITL checkpoint               (1 auto-retry)
+                      │                                │
+         ┌────────────┴────────────┐           Assemble → Sandbox
+         │ approved                │ rejected
+         ▼                         ▼
+     Delivered                  Aborted
+```
+
+### Components and Their Responsibilities
+
+**Vision Agent** — Only invoked when `image_b64` is present in the request. Uses Claude Sonnet's multimodal capability to extract a `PipelineIntent` (column definitions + transformation description) from a screenshot. When absent, the orchestrator parses text directly.
+
+**Orchestrator Agent** — Takes either raw text or a vision-extracted `PipelineIntent` and refines it into a fully specified `PipelineIntent`. This is the system's planning layer: it resolves ambiguity, infers column types, and produces the specification all downstream agents will work from.
+
+**Schema Agent (Haiku)** — Produces a `SchemaContract`: the exact columns expected in input and output, primary key if present, and how many synthetic rows to generate for testing. This is a structured extraction task — Haiku handles it without quality loss.
+
+**Code Agent (Sonnet)** — Generates a Polars transformation script. The only reasoning-heavy task in the parallel stage: it must understand the transformation semantics, Polars API patterns, edge cases, and produce valid Python. Justifies the more capable model.
+
+**Test Agent (Haiku)** — Generates a pytest suite. The test structure is predictable: arrange (load the input CSV), act (run the script), assert (check output columns and row counts). Haiku is appropriate here.
+
+**Docs Agent (Haiku)** — Generates a README for the pipeline. Deterministic templating from known inputs. Haiku is more than sufficient.
+
+**Merge Node** — The convergence point for the four parallel agents. Unpacks `agent_outputs` by discriminator field into typed Pydantic models. Without this node, the reducer list would remain unstructured.
+
+```python
+for raw in state.get("agent_outputs", []):
+    output = AgentOutput(**raw)
+    match output.agent_type:
+        case "schema":
+            result["schema_contract"] = SchemaContract(**output.payload)
+        case "code":
+            result["generated_script"] = GeneratedScript(**output.payload)
+        ...
+```
+
+**Assemble Node** — Builds a `FileBundle` from the typed outputs. Maps filenames to content. This is a pure data transformation node — no LLM involved.
+
+**Sandbox Executor** — The most operationally important component. Creates a temp workspace, writes all bundle files to it, generates a synthetic CSV using Faker and Polars (schema-aware, column-typed), mounts the workspace into an ephemeral Docker container, runs the main script, then runs the test suite. Returns a `SandboxResult` with stdout, stderr, exit code, and execution time.
+
+**Code Fix Node** — On sandbox failure, this node re-invokes the code agent with the stderr from the failed run appended to the prompt. It writes directly to `generated_script` (bypassing the merge node) and increments `fix_attempts`. One retry is permitted; a second failure routes to review with errors exposed.
+
+**Review Node** — Calls `interrupt()` to pause execution and surface the `FileBundle` and sandbox results to the human reviewer. The graph is persisted via `MemorySaver` (or a production checkpointer). `/resume` continues execution based on approval.
+
+### State Design
+
+```python
+class AgentState(TypedDict, total=False):
+    raw_input: str
+    image_b64: str | None
+    pipeline_intent: PipelineIntent | None
+    agent_outputs: Annotated[list[dict], operator.add]  # reducer
+    schema_contract: SchemaContract | None
+    generated_script: GeneratedScript | None
+    test_suite: TestSuite | None
+    generated_docs: GeneratedDocs | None
+    sandbox_result: SandboxResult | None
+    file_bundle: FileBundle | None
+    fix_attempts: int
+    error: str | None
+```
+
+`total=False` means all fields are optional by default, which avoids the need to pre-populate state at invocation. Fields without a reducer use last-writer-wins — safe for sequential writes, unsafe for concurrent ones. Only `agent_outputs` is concurrent, so only it has a reducer.
+
+### Design Trade-offs
+
+**Why LangGraph instead of plain async Python?**
+
+Async Python can handle parallel LLM calls, but you get no persistence, no built-in HITL, no replay, and no graph visualization. LangGraph buys you all of these. The cost is framework complexity and a learning curve around the `Send` API and reducers. The trade-off is correct for any pipeline that needs checkpointing or HITL.
+
+**Why not have the orchestrator produce all four outputs sequentially?**
+
+Sequential orchestration is the obvious design and it is wrong for this use case. Schema, code, tests, and docs are independent — none of them depends on the others' LLM output. Running them in parallel cuts latency from `sum(latencies)` to `max(latencies)`, which on Haiku calls can be a 2-4x improvement.
+
+**Why a separate assemble node rather than assembling in the merge node?**
+
+Separation of concerns. Merge is about unpacking concurrent state. Assembly is about constructing a deployment artifact. They are different operations that could evolve independently — for example, adding a linting step between merge and assemble without touching merge logic.
+
+**Why Docker SDK instead of subprocess?**
+
+`subprocess` gives you no resource isolation. A generated script could read the filesystem, call external services, or spin up unlimited processes. The Docker SDK gives you hard limits on memory, CPU, network, and PIDs per execution. The ephemeral container model means no state leaks between runs. This is not over-engineering — it is the minimum viable sandbox for running untrusted LLM-generated code.
+
+---
+
+## 4. Implementation Details
+
+### Structured Output and the `ge`/`le` Problem
+
+All agent outputs are typed via Pydantic v2 models and passed through `model.with_structured_output(Model)`. This forces the LLM to return valid JSON matching the schema.
+
+A non-obvious constraint: Anthropic's structured output format rejects JSON Schema `minimum` and `maximum` keywords on numeric fields. A schema like:
+
+```python
+sample_row_count: int = Field(ge=10, le=10000)
+```
+
+...causes a validation error on the API call itself. The workaround is to encode bounds in the field description:
+
+```python
+sample_row_count: int = Field(
+    default=200,
+    description="Number of synthetic rows to generate for testing (10 to 10000)",
+)
+```
+
+This is a Pydantic v2 / Anthropic structured output compatibility issue that is not documented prominently. It affects any numeric field with bounds.
+
+### Jinja2 Prompt Templates
+
+Prompts are not embedded as Python f-strings. Each agent has a corresponding `.jinja2` template. This separates prompt content from Python logic, makes prompts reviewable as first-class text files, and allows for structured iteration without touching agent code. Templates receive `intent`, column definitions, and optional error context as variables.
+
+For the code fix path:
+
+```jinja2
+{% if error %}
+## Previous Execution Error
+The script failed with the following error:
+{{ error }}
+
+Fix the script to resolve this error.
+{% endif %}
+```
+
+The same `run_code_agent` function serves both initial generation and fix attempts — the `error` parameter controls which prompt branch is rendered.
+
+### Async and Docker's Synchronous SDK
+
+The Docker Python SDK is synchronous. The LangGraph graph runs in an async context. Running blocking Docker calls directly in an async node will block the event loop and stall all parallel branches.
+
+The fix is `asyncio.to_thread()`:
+
+```python
+exit_code, stdout, stderr = await asyncio.to_thread(
+    self._run_container, client, workspace, command
+)
+```
+
+This is a pattern every AI engineer building async pipelines that call synchronous SDKs (Docker, some database drivers, legacy clients) needs to have internalized.
+
+### SSE Streaming via `astream_events v2`
+
+The API streams pipeline progress to the client using Server-Sent Events. LangGraph's `astream_events(input, config, version="v2")` yields granular node-level events — `on_chain_start`, `on_chain_end`, `on_llm_start`, `on_llm_stream`, etc. These are mapped to typed SSE events and pushed to the client in real time.
+
+```python
+async for event in graph.astream_events(input_state, config, version="v2"):
+    yield {"event": event["event"], "data": json.dumps(event.get("data", {}))}
+```
+
+The client can display which agents are running, which have completed, and what the sandbox returned — without polling.
+
+### Model Routing via Settings
+
+Model assignment is centralized in `core/llm.py` behind a `get_model(agent_role)` factory. This means model assignments can be changed in a single place — in configuration or environment variables — without modifying any agent code. Swapping `code` from Sonnet to Opus for a high-stakes deployment is a one-line config change.
+
+### Synthetic Data Generation
+
+The sandbox needs real input data to run the script against. Rather than requiring user-provided test data, the system generates it from the `SchemaContract` using Faker + Polars. Each column is mapped to the appropriate Faker method:
+
+```python
+def to_faker_method(self) -> str:
+    mapping = {
+        "str": "word",
+        "int": "random_int",
+        "float": "pyfloat",
+        "date": "date_this_decade",
+        ...
+    }
+    return mapping[self.dtype]
+```
+
+This means the sandbox can execute immediately — no user-side file upload required, and the test data is schema-consistent.
+
+---
+
+## 5. From Prototype to Production
+
+### Checkpointer: MemorySaver → AsyncPostgresSaver
+
+The current implementation uses `MemorySaver`, which stores graph state in process memory. This works locally and is sufficient for development. In production, it means HITL state is lost on process restart — a user whose pipeline is paused at the review node loses their session if the server restarts.
+
+The fix is straightforward: swap `MemorySaver` for `AsyncPostgresSaver` from `langgraph-checkpoint-postgres`. Thread state is then persisted in Postgres, survives restarts, and is queryable. The graph compilation changes from:
+
+```python
+MemorySaver()
+```
+
+to:
+
+```python
+async with AsyncPostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
+    graph = compile_graph(checkpointer=checkpointer)
+```
+
+This is one of the clearest prototype-to-production gaps in any LangGraph system.
+
+### Observability
+
+The system integrates Langfuse for distributed tracing. Each pipeline execution creates a session, and the Langfuse callback handler is attached to every graph invocation. Because the four specialist agents run in parallel, their spans appear as concurrent horizontal bands in the Langfuse trace UI — this is the correct mental model for debugging latency in fan-out pipelines.
+
+In production, you want:
+
+- **Token counts per agent** — to monitor cost by node, not just overall.
+- **Latency percentiles per node** — to identify which agent is the bottleneck in the `max(latencies)` calculation.
+- **Sandbox exit codes** — to monitor script generation quality (failure rate, fix rate).
+- **HITL decision rates** — what percentage of outputs are approved vs. rejected.
+
+None of this requires custom instrumentation beyond the Langfuse handler — it is all surfaced from `astream_events v2` metadata.
+
+### Scaling Considerations
+
+Each pipeline execution is stateless within the graph (state lives in the checkpointer). Horizontal scaling is therefore straightforward — multiple API instances share the Postgres checkpointer and a Docker daemon (or a remote Docker host via `DOCKER_HOST`).
+
+The sandbox is the scaling bottleneck. Each execution spins up a Docker container. At high concurrency, you will exhaust container limits on a single Docker host. The production solution is to route sandbox execution to a container execution service (AWS ECS run-task, Google Cloud Run jobs, or a dedicated container pool) rather than calling Docker locally.
+
+### Security Considerations
+
+The sandbox already handles the most critical concern — untrusted code execution. Additional hardening for production:
+
+- **Image pinning**: The sandbox Dockerfile should pin all dependency versions (they already are: `polars==1.20.0`, `pytest==8.3.4`, etc.). Never use `latest` tags in a sandbox image.
+- **Read-only workspace**: The volume mount is currently `rw`. For scripts that only need to write output files, consider a read-only base layer with a separate writable output directory.
+- **Secret scrubbing**: If user descriptions contain API keys or passwords (intentionally or not), they propagate into agent prompts. A scrubbing step before the orchestrator is warranted in production.
+- **Input validation**: The `/generate` endpoint should enforce a maximum description length and reject base64 images above a size threshold before they reach the vision agent.
+- **Rate limiting**: Per-user or per-tenant limits on pipeline executions are essential, as each execution incurs non-trivial LLM API cost and Docker overhead.
+
+### Failure Modes and Mitigations
+
+| Failure | Behavior | Mitigation |
+|---|---|---|
+| Code agent generates syntactically invalid Python | Sandbox fails, stderr captured | One automatic code fix retry with stderr injected into prompt |
+| Fix retry also fails | Routes to HITL review with errors visible | Human can reject and re-submit with a clearer description |
+| Docker daemon unavailable | `SandboxExecutor` raises `DockerException` | Catch at node level, write error to state, route to review |
+| LLM structured output validation fails | Pydantic raises `ValidationError` | Retry with exponential backoff at the agent call level |
+| HITL session expires (server restart with MemorySaver) | State lost | Replace MemorySaver with AsyncPostgresSaver |
+| Langfuse unavailable | Handler creation returns `None` | Graph continues without tracing — graceful degradation |
+
+---
+
+## 6. Key Learnings
+
+### What Worked Well
+
+**The Send API + Annotated reducer combination is the right pattern for specialist fan-out.** Once the mental model clicks — dispatch creates branches, the reducer accumulates without dropping, the merge node reconstructs typed outputs — it is clean and predictable. Any pipeline with independent specialist tasks should use this pattern.
+
+**Model tiering works.** Assigning Haiku to schema, test, and docs generation produces indistinguishable output from Sonnet at those tasks. The quality difference only materializes in code generation, where Sonnet's deeper reasoning about Polars API usage and edge cases is visible. Three of five agents on Haiku is a meaningful cost reduction.
+
+**Structured output + Pydantic v2 throughout eliminates a class of bugs.** Every agent boundary is typed. There is no string parsing of LLM output anywhere in the system. When an agent fails, the error is a `ValidationError` with a precise field path, not an unstructured string. This dramatically reduces debugging time.
+
+**Jinja2 templates for prompts are better than f-strings.** Prompts are long, have conditional branches (the fix path), and need to be readable in isolation. Templates enforce this. F-strings punish it.
+
+**Docker SDK sandboxing is not optional.** Running LLM-generated code in subprocess without isolation is untenable for any production system. The Docker SDK overhead (container spin-up time) is real but acceptable given the safety guarantees.
+
+### What Didn't Work / Unexpected Friction
+
+**`ge`/`le` on Pydantic fields breaks Anthropic structured output.** This is a silent failure — the API call itself errors, not the LLM output. It is not obvious from the error message what the fix is. Any team adopting this pattern will hit it.
+
+**The Docker SDK is synchronous in an async world.** Every Docker call requires `asyncio.to_thread()`. This is mechanical but easy to forget — forgetting it manifests as inexplicable hangs under load, not immediate errors. It should be documented as a first-class concern in any async agentic system that calls synchronous SDKs.
+
+**MemorySaver is a trap for demos.** It looks like it works because it does work — until the server restarts mid-HITL review. The correct default for any non-trivial demo is a lightweight external checkpointer (SQLite or Postgres), not in-memory state.
+
+**Parallel agent debugging is harder than sequential debugging.** When one of four parallel agents fails, the error appears in the `agent_outputs` reducer at merge time, not immediately at the failing node. LangGraph's trace in Langfuse helps significantly here — the parallel spans make it visually obvious which branch failed.
+
+### What Would Be Done Differently
+
+**Add a validation step between merge and assemble.** Currently, if the code agent generates a script that imports a library not in the sandbox image, the failure only surfaces at sandbox execution time. A static analysis node (running `ast.parse()` or a dependency extractor) between merge and assemble could catch a class of errors before Docker is involved.
+
+**Introduce agent output versioning.** The `AgentOutput` discriminator is a string literal. As the system evolves and agent outputs change, there is no version field to handle backward compatibility in persisted state. Adding `schema_version: str` to `AgentOutput` is cheap and prevents hard-to-debug state deserialization failures in long-running deployments.
+
+**Make the fix loop configurable, not hardcoded.** The single retry is currently baked into `route_after_sandbox`. In production, this should be a configuration value — some teams want zero retries (all failures to human review), others want three.
+
+---
+
+## 7. Where This Can Go Next
+
+### Immediate Extensions
+
+**Multi-language output.** The code agent currently generates Polars (Python). The same architecture supports SQL (dbt models), PySpark, or TypeScript ETL — it is a prompt and sandbox image change, not an architectural one. A `target_runtime` field in `PipelineIntent` and a corresponding sandbox image registry is all it takes.
+
+**Streaming sandbox output.** The current sandbox runs to completion and returns all output. Docker supports log streaming via `container.logs(stream=True)`. Surfacing live sandbox stdout over SSE would make the UX significantly better for long-running transformations.
+
+**Iterative refinement.** The HITL review currently supports approve/reject. It could support "reject with feedback" — a text field whose content is passed back to the code agent as additional context. This turns the pipeline from a one-shot generator into an iterative pair-programming tool.
+
+**Schema inference from uploaded files.** Currently the user describes the schema in natural language. Adding a file upload endpoint that runs schema inference on a real CSV (using Polars `scan_csv()` + `schema`) would eliminate the most error-prone step in the pipeline.
+
+### Architectural Extensions for Production Scale
+
+**Async checkpointer + worker pool.** Replace the synchronous SSE-per-request model with a task queue (Celery, RQ, or Temporal). The client submits a job, polls or subscribes to a status endpoint, and the worker pool executes the graph asynchronously. This decouples API latency from pipeline latency.
+
+**Multi-tenant state isolation.** Thread IDs in `MemorySaver` are already per-request. Extending this to per-tenant namespaces in Postgres and adding access controls on `/resume` is the foundation of a multi-tenant deployment.
+
+**Evaluation harness.** The 50 existing tests cover unit behavior. A production system needs an evaluation pipeline: a set of canonical transformation descriptions with known correct outputs, scored against the pipeline's actual outputs. LangSmith or Langfuse datasets + evaluators can automate this — critical for detecting regressions when models or prompts change.
+
+### Potential for Real-World Adoption
+
+The narrow version — a script generator — is useful but niche. The broader pattern — a multi-agent pipeline that takes natural language intent, dispatches specialist workers in parallel, validates output in a sandbox, and gates delivery behind HITL review — is a general architecture for any domain where LLM-generated artifacts need to be verified before use.
+
+Direct applications include: infrastructure-as-code generators (CloudFormation, Terraform), dbt model generators, API client code generators, test suite generators for existing code, and configuration file generators for CI/CD pipelines. In each case, the architecture is identical — only the specialist agents, output schemas, and sandbox environment change.
+
+The HITL-gated delivery model is particularly important for enterprise adoption. It provides a clear answer to the "what happens when the AI is wrong" question: a human sees the output before it goes anywhere. The pipeline's job is to reduce the human's review burden, not to replace the human entirely.
+
+---
+
+## Appendix: Stack Summary
+
+| Layer | Technology | Why |
+|---|---|---|
+| Orchestration | LangGraph 0.4+ | Send API, interrupt(), MemorySaver, astream_events |
+| LLM | Claude Sonnet 4.5 + Haiku 4.5 (via OpenRouter) | Model tiering — capability where needed, cost savings where not |
+| Serving | FastAPI + SSE (sse-starlette) | astream_events v2 maps naturally to SSE |
+| Sandboxing | Docker Python SDK | Resource isolation, no network egress, ephemeral containers |
+| Data generation | Faker + Polars | Schema-aware synthetic CSV without user-provided test data |
+| Schemas | Pydantic v2 | Structured output throughout, typed agent boundaries |
+| Observability | Langfuse (self-hosted) | Parallel span visualization, session tracking, token counts |
+| Prompts | Jinja2 | Readable, conditionally-branching prompt templates |
+| Config | pydantic-settings | Env-prefix namespaced config, typed settings objects |
+| Tooling | uv, ruff, mypy, pytest | 50 tests, 0 lint errors, strict typing |
