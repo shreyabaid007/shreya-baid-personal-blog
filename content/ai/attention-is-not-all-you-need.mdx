@@ -1,60 +1,683 @@
 ---
-title: "Attention Is Not All You Need"
-description: "The transformer paper made a bold claim. Seven years later, it's worth being precise about what attention actually does — and what it doesn't."
-date: "2024-11-15"
-tags: ["transformers", "attention", "ML theory"]
+title: "Building, Productionizing, and Deploying an Agentic AI System"
+description: "A full-stack AI agent that converts natural language into SQL; generating, validating, executing, and explaining database queries in real time."
+date: "2025-09-30"
+tags: ["AI Agents", "Tool Calling", "LangGraph", "DuckDB", "PostgreSQL"]
 draft: false
 ---
 
-The 2017 paper *Attention Is All You Need* introduced the transformer and, with a slight excess of marketing confidence, suggested that attention mechanisms were sufficient for sequence modelling. The claim aged remarkably well in some respects and poorly in others.
+## The framework question
 
-This is my attempt to be precise about what attention actually does, why it works so well, and where the title overpromises.
+Before you write a single line of application code, you face this choice: which framework do you use to orchestrate the agent? And the honest answer is: it depends on what you value.
 
-## What attention is, mechanically
+Here's how I think about the tradeoffs. Raw LLM API loops give you total control — you manage the conversation history yourself, decide when to call tools, handle errors, track state. It's not that much code for a simple agent. The problem is that as soon as you need checkpointing (persisting conversation state across requests), streaming, or human-in-the-loop interrupts, you're building infrastructure that isn't your core problem. You'll spend two weeks building the scaffolding instead of the agent itself.
 
-At its core, self-attention is a weighted averaging operation. For each position in a sequence, you compute a weighted sum of the values at all other positions, where the weights are determined by the similarity between queries and keys.
+LangChain sits on the other end: it abstracts almost everything, has an enormous ecosystem of prebuilt components, and is well-documented. The problem is that when something goes wrong — and something always goes wrong in production — you're debugging through layers of abstraction. A simple error turns into archaeology.
+
+LangGraph gives you explicit state machines — you define nodes, you define edges, you define the conditions that route between them. The graph is not magic. You can look at it and understand exactly what will happen for any given state. It also ships with checkpointing, streaming, and `interrupt()` as first-class primitives. These are things you would absolutely need to build yourself otherwise.
+
+The tradeoff is a learning curve. If you've never thought in terms of state graphs before, the mental model takes a few hours to internalize. Worth it!
+
+---
+
+## The graph itself
+
+Let's look at the actual graph construction, because it's simpler than you might expect:
 
 ```python
-def attention(Q, K, V):
-    d_k = Q.shape[-1]
-    scores = Q @ K.T / math.sqrt(d_k)  # scale to prevent vanishing gradients
-    weights = softmax(scores, dim=-1)
-    return weights @ V
+# src/app/graphs/chat/graph.py
+def create_chat_graph(
+    anthropic_client: AsyncAnthropic,
+    tool_handler: ToolHandler,
+    prompt_store: PromptStore,
+    checkpointer: Any = None,
+) -> CompiledStateGraph:
+    builder = GraphBuilder(state_schema=ChatGraphState)
+
+    llm_node  = LLM(anthropic_client=anthropic_client, ...)
+    tool_node = Tool(tool_handler=tool_handler)
+
+    builder.add_nodes({"llm": llm_node, "tool": tool_node})
+    builder.add_edges([(START, "llm"), ("tool", "llm")])
+    builder.add_conditional_edges(source="llm", condition=is_tool_call)
+
+    return builder.compile(checkpointer=checkpointer)
 ```
 
-That's it. The sophistication is in what Q, K, and V are trained to represent — not in the operation itself.
+Two nodes. Three edges (one unconditional start, one unconditional tool→llm return, one conditional llm→tool-or-END). The entire agent loop is:
 
-## What it does well
+```
+START
+  │
+  ▼
+[LLM Node]  ←────────────────┐
+  │                           │
+  ├─── wants tool call? ──→ [Tool Node]
+  │                           │
+  └─── done? ──→ END          └──────────────────┘
+```
 
-**Long-range dependencies.** RNNs pass information through a chain of hidden states. Every step is a bottleneck. Attention connects any two positions in O(1) operations, regardless of distance. For tasks where context at position 1 matters for a decision at position 512, this matters enormously.
+The conditional edge is a function that reads the last message in the state and asks: does it contain any `tool_use` blocks? If yes, route to the tool node. If no, route to END.
 
-**Parallelisation.** RNNs are sequential by nature — you can't compute hidden state *t* before hidden state *t-1*. Attention over a full sequence is a matrix multiplication, which hardware accelerators do very efficiently in parallel. This is why transformers scaled — training speed, not just quality.
+```python
+# src/app/graphs/chat/edges.py
+def is_tool_call(state: ChatGraphState) -> str:
+    last_message = state.messages[-1]
+    for block in last_message.get("content", []):
+        if block.get("type") == "tool_use":
+            return "tool"
+    return END
+```
 
-**Interpretability (to a degree).** You can visualise attention weights. They're not always meaningful, but the machinery to inspect them exists. RNN hidden states are notoriously opaque.
+That's the agent. Not sixty lines of orchestration code — one function that checks if the last message contains a tool call. Everything else flows from this.
 
-## What it doesn't do
+---
 
-**It doesn't understand position.** Attention is permutation-equivariant. If you shuffle the input tokens, you get shuffled outputs — the same information, reordered. You have to add positional encodings by hand. The original paper used fixed sinusoidal encodings. RoPE and ALiBi are more recent attempts to solve this less hackily.
+## State: what the agent remembers
 
-**It doesn't handle arbitrary-length sequences cheaply.** Self-attention is O(n²) in sequence length. This is fine for sentences. It's a problem for entire documents, codebases, or genome sequences. The field has been working on this since roughly 2019, with varying success.
+Every node in the graph receives a `ChatGraphState` and returns an updated one. The state is the agent's working memory for a conversation thread:
 
-**It doesn't replace inductive biases.** Convolutions encode spatial locality. Attention doesn't — you can't easily tell a transformer "nearby tokens probably matter more than distant ones." For tasks where that prior is correct (most vision tasks, for instance), convolutions are hard to beat on efficiency grounds even today.
+```python
+@dataclass
+class ChatGraphState:
+    messages: list[dict]        # full conversation history
+    stop_reason: str | None     # why did the LLM stop?
+    interrupt_policy: str       # "never" | "final" | "always"
+    connection_id: str | None   # which database to query
+```
 
-## The actual claim, accurately stated
+I want to highlight something important here: **keep state minimal.** Your instinct might be to stuff everything into state — the schema, the user preferences, some computed fields. Resist this. State is serialized and persisted on every graph step. Every field you add is bytes stored in PostgreSQL for every conversation turn. Keep only what nodes genuinely need to share with each other. Configuration (LLM model name, mode, schema) flows through LangGraph's `config` object, not state.
 
-Transformers are an excellent general-purpose architecture for sequence modelling when:
-- You have enough data to learn structure from scratch
-- You have hardware that can exploit parallelism
-- Sequence lengths are manageable
+The persistence story is worth understanding. When a request comes in with a `thread_id`, LangGraph's `AsyncPostgresSaver` restores the state from the most recent checkpoint. When the agent finishes running, it writes a new checkpoint. This is how you get multi-turn conversations with no extra work — the conversation history accumulates in the checkpoints, and the LLM node just sends `state.messages` to the API each turn.
 
-They're not magic. They're a well-engineered combination of existing ideas — attention mechanisms (which predate the paper), residual connections (He et al., 2015), layer normalisation, and multi-head projections.
+```python
+# Checkpointer setup at startup (src/app/api/lifespan.py)
+checkpointer = AsyncPostgresSaver(conn=db_pool)
+graph = create_chat_graph(..., checkpointer=checkpointer)
+```
 
-The claim in the title was good marketing. The actual contribution was demonstrating that you could remove recurrence entirely — not that attention was sufficient for all sequence tasks. That's a more precise and more interesting claim.
+You do need to initialize the checkpoint tables, which is why `scripts/initialize_db.py` calls `checkpointer.setup()`. Run this once before you start the server and you get persistent conversation state for free.
 
-## Where this leaves us
+---
 
-Modern LLMs are not just transformers. They're transformers plus enormous training datasets, plus careful instruction tuning, plus RLHF or DPO alignment stages. The architecture is the least interesting part of what makes GPT-4 or Claude different from previous generation models.
+## The LLM node: where the interesting stuff happens
 
-The lesson is not "transformers are magic." The lesson is that architecture matters less than we thought, and data and scale matter more. That's both liberating (you don't need a clever architecture to do something useful) and concerning (the advantages accrue primarily to those with resources to build and curate large datasets).
+The LLM node is where Claude is called. Let's look at what's actually going on.
 
-That asymmetry is worth sitting with.
+### Extended thinking
+
+This system uses Claude with extended thinking enabled. Extended thinking is the model's internal scratchpad — it reasons step by step before producing a final answer, and those reasoning steps are visible in the response stream (as `thinking` blocks). For SQL generation specifically, this is meaningful. The model can reason through: "The user asked about 'last quarter' — I should figure out what date range that is. The orders table has a `created_at` column. I should use DATE_TRUNC to aggregate by month..." before committing to any SQL.
+
+Extended thinking costs more tokens and takes longer. But for complex multi-table joins or ambiguous natural language questions, the accuracy improvement is real. This is a tradeoff worth making in a product where a wrong query is worse than a slow one.
+
+### Primary and fallback models
+
+Production systems fail in non-obvious ways. One of the most common: the API is overloaded. You're having a good launch day, traffic is up, and Claude Opus 4.6 starts returning 529s. What happens then?
+
+```python
+# src/app/graphs/chat/nodes/llm.py
+async def __call__(self, state, config, writer) -> ChatGraphState:
+    node_config = self._validate_config(config)
+    try:
+        return await self._execute_with_model(
+            node_config["primary_model"], ...
+        )
+    except Exception as primary_error:
+        logger.warning("Primary model failed, falling back...")
+        try:
+            return await self._execute_with_model(
+                node_config["secondary_model"], ...
+            )
+        except Exception as fallback_error:
+            raise Exception(
+                f"Both models failed — Primary: {primary_error}, "
+                f"Fallback: {fallback_error}"
+            ) from fallback_error
+```
+
+You configure both models per request via LangGraph's `config.configurable`. In practice this means: Opus is primary, Sonnet is fallback. Users get a slightly less detailed response instead of an error page. The fallback is transparent to users and shows up in your LangSmith traces as a warning.
+
+### Prompt caching: the optimization nobody does early enough
+
+The system prompt here includes the entire database schema as XML — for a moderately complex database, that's easily 800-2000 tokens. With every conversation turn, you're paying for those tokens. With prompt caching (`cache_control: ephemeral`), Anthropic caches the prompt for ~5 minutes and you pay for it once per cache window instead of once per message.
+
+```python
+system=[
+    {
+        "type": "text",
+        "text": f"<current_date> {datetime.now(timezone.utc).date()} </current_date>",
+    },
+    {
+        "type": "text",
+        "text": rendered_prompt,           # schema + instructions
+        "cache_control": {"type": "ephemeral"},  # ← cached
+    },
+]
+```
+
+Note that the date is in a *separate* block without cache_control — because the date changes every day and you don't want it to be part of the cached content. The schema block is the expensive one. This is a two-line change that can cut your per-conversation costs by 40-60% in a multi-turn chat. Do it early.
+
+Also notice the tool schema caching:
+
+```python
+# In LLM.__init__
+self.tool_schemas = list(tool_schemas.values())
+self.tool_schemas[-1]["cache_control"] = {"type": "ephemeral"}
+```
+
+The last tool in the list gets the cache_control marker. Anthropic caches everything up to and including the last cache marker in the request, so this effectively caches both the system prompt and the tool definitions — both of which are static per-request.
+
+---
+
+## The tool: where safety becomes non-negotiable
+
+The agent has one tool: `QueryExecutorTool`. It takes a SQL query and executes it. Before execution, it does two things in order: validates that the SQL is read-only, and (optionally) pauses to let the user review it.
+
+### Why sqlglot and not string matching
+
+The naive way to enforce read-only access is to check if the query starts with `SELECT`. This is immediately broken by:
+
+```sql
+-- legitimate looking prefix, destructive operation
+WITH delete_op AS (DELETE FROM users RETURNING id)
+SELECT * FROM delete_op;
+```
+
+Or by prompt injection where a user's data contains SQL that gets included in a query. The correct approach is to parse the SQL into an AST and check the node types:
+
+```python
+# src/app/tools/db.py
+def validate_read_only(sql: str) -> bool:
+    try:
+        statements = sqlglot.parse(sql)
+        for stmt in statements:
+            if stmt is None:
+                continue
+            if not isinstance(stmt, sqlglot.exp.Select):
+                return False  # DDL/DML detected → reject
+        return True
+    except sqlglot.errors.ParseError:
+        return False  # unparseable → reject
+```
+
+`sqlglot` understands SQL grammar. It parses the query into a tree of typed expressions and you check the root node type. You can't fool it with string manipulation. A statement that isn't a `Select` expression gets rejected, full stop.
+
+The secondary validation — re-validating after human modification — is equally important:
+
+```python
+if human_feedback.query != input_data.query:
+    if not validate_read_only(human_feedback.query):
+        return json.dumps({
+            "error": "Modified query must also be SELECT-only."
+        })
+```
+
+The user might try to slip in a `DROP TABLE` after the interrupt. Or they might accidentally paste something destructive. Validate again.
+
+One more thing: the system prompt also instructs the model not to write destructive SQL. "You are NOT allowed to execute CREATE, DROP, INSERT, UPDATE, DELETE, ALTER, TRUNCATE." This is the first line of defense. The sqlglot validation is the second. You want both. A prompt can be overridden — it is, after all, just text. Code cannot be overridden by text.
+
+### Human-in-the-loop: the underappreciated primitive
+
+LangGraph's `interrupt()` is one of those features that sounds niche until you realize it solves a real problem. The scenario: your agent is about to run a query against a production database that contains real customer data. You want the user to see the SQL before it executes. Without HITL, you'd need to: split the request into two HTTP calls, persist the SQL somewhere between them, resume the agent with the approved SQL. That's a fair amount of plumbing.
+
+With `interrupt()`:
+
+```python
+if should_interrupt:
+    human_feedback = interrupt(value=input_data.query)
+    # execution pauses here. The graph is suspended.
+    # The client gets an SSE event with the SQL.
+    # When the client sends a resume request, execution continues here.
+    human_feedback = QueryExecutorHumanFeedback.model_validate(human_feedback)
+    input_data.query = human_feedback.query
+```
+
+The `interrupt()` call suspends the entire graph execution at that point. LangGraph persists the suspended state as a checkpoint. The client receives an `__interrupt__` SSE event with the SQL string. When the user approves (or edits) and submits, the client calls `/v1/api/resume/{user_id}/{thread_id}` with the feedback. LangGraph restores from the checkpoint and continues from exactly where `interrupt()` was called.
+
+The interrupt policy lets users control how aggressive this is:
+
+- `never` — trust the model, run queries immediately. Good for read-only analytics dashboards where the user doesn't care about the SQL.
+- `final` — interrupt only for the query that directly answers the user's question (tagged as `purpose: "final"` by the model). Intermediate exploratory queries run freely. This is the right default for most uses.
+- `always` — interrupt before every query. For sensitive production databases where you want a human eye on everything.
+
+The `purpose` field on the tool input is how the model communicates intent:
+
+```python
+class QueryExecutorInput(BaseModel):
+    purpose: Literal["intermediate", "final"]
+    query: str
+```
+
+The model is instructed in the system prompt to mark intermediate exploratory queries (checking what data exists, verifying schema assumptions) as `intermediate`, and the final answering query as `final`. The interrupt policy then filters based on this. If you only interrupt on `final`, you get exactly the right behavior: the agent can explore freely, but you review the thing that actually matters.
+
+---
+
+## Streaming: the experience problem
+
+Here's a concrete claim: if your AI application doesn't stream responses, users will think it's broken during any response that takes more than two seconds. This is not a hypothesis. It's observed behavior. A blank screen for 5 seconds followed by the full response is worse UX than token-by-token streaming that takes 7 seconds total.
+
+Streaming from an async Python backend to a browser has some gotchas worth knowing.
+
+### Why POST for SSE
+
+The browser's native `EventSource` API only supports GET requests. But you need a request body — the user's message, the database schema, the conversation mode. Options:
+
+1. Use GET with query parameters (ugly, limited length, not suitable for schema XML)
+2. Use WebSockets (more complex, stateful connection, overkill here)
+3. Use `fetch` with `ReadableStream` (the right answer)
+
+The third option: POST to the streaming endpoint, read the response body as a stream, parse SSE frames manually. It's about 30 lines of TypeScript:
+
+```typescript
+// frontend/src/lib/sse.ts
+export async function* streamSSE(url, body, apiKey, signal) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop()!;
+    for (const frame of frames) {
+      // yield { event, data }
+    }
+  }
+}
+```
+
+On the backend, `StreamingResponse` with `media_type="text/event-stream"`:
+
+```python
+# src/app/api/routers/chat.py
+return StreamingResponse(
+    _execute_stream(graph, input, config),
+    media_type="text/event-stream",
+    headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",   # ← do not miss this
+    },
+)
+```
+
+That `X-Accel-Buffering: no` header is the most common thing people miss when deploying streaming to Vercel or any nginx-proxied environment. Without it, nginx buffers the response — you get nothing for 8 seconds and then the full response at once. With it, every token goes through immediately. Set it.
+
+### What flows through the stream
+
+The stream carries structured events, not just text. The LLM node emits custom events via LangGraph's `StreamWriter`:
+
+```python
+writer({"block-start": "text"})
+writer({"text": delta_text})         # every token
+writer({"block-end": "text"})
+
+writer({"block-start": "tool-input"})
+writer({"tool-input": partial_json}) # tool call args as they arrive
+writer({"block-end": "tool-input"})
+```
+
+The tool node emits:
+
+```python
+writer({"block-start": "tool-output"})
+writer({"tool-output": result_string})
+writer({"block-end": "tool-output"})
+```
+
+The frontend switches on event types and assembles the message incrementally. The user sees: the model's reasoning text stream in, then the SQL appear character by character (from `tool-input` events), then the result table pop in (from `tool-output`), then the analysis text stream. It feels like watching the agent think in real time — because it is.
+
+---
+
+## Prompt engineering: XML, Jinja2, and conditional modes
+
+The system prompt lives in `prompts/system.jinja2` and gets rendered with Jinja2 before each request. This might look like over-engineering (why not just a Python f-string?), but there's a genuine reason.
+
+### Conditional modes
+
+The agent has three modes: `generate` (write and run SQL), `explain` (break down existing SQL clause-by-clause), and `optimize` (analyze and rewrite for performance). In generate mode, you need detailed instructions about iterative query execution, checking results, and refining. In explain mode, those instructions are irrelevant and would confuse the model. With Jinja2:
+
+```jinja2
+{% if mode == "generate" %}
+<query_execution_process>
+    <iterative_refinement>
+        Validate that the data returned answers the user's question.
+        Check for anomalies. Consider if additional queries are needed.
+        ...
+    </iterative_refinement>
+    <verification_steps>
+        Verify calculations. Cross-check totals. Validate period changes.
+    </verification_steps>
+</query_execution_process>
+{% endif %}
+```
+
+Mode-specific behavior controlled by one variable. You could also solve this with separate prompt files and a lookup — but templating keeps it in one place, which matters when you're iterating on prompt quality.
+
+### XML for schema context
+
+The database schema gets injected as XML:
+
+```xml
+<database_schema>
+  <table name="orders">
+    <column name="id" type="INTEGER" primary_key="true"/>
+    <column name="customer_id" type="INTEGER"/>
+    <column name="total" type="DECIMAL(10,2)"/>
+    <column name="created_at" type="TIMESTAMP"/>
+  </table>
+</database_schema>
+```
+
+Why XML and not JSON or Markdown? Frontier models are trained on massive amounts of structured XML. More importantly, XML's explicit open/close tag structure makes it unambiguous to parse — the model can clearly distinguish schema content from instructions or user messages. JSON requires careful escaping and is harder to visually scan when you're debugging prompts. Markdown tables lose column type information. XML just works better here, and if you're skeptical, try both and evaluate on a set of test questions.
+
+### The tool schema caching trick
+
+Notice in the LLM `__init__`:
+
+```python
+self.tool_schemas = list(tool_schemas.values())
+self.tool_schemas[-1]["cache_control"] = {"type": "ephemeral"}
+```
+
+Anthropic's prompt caching applies to everything up to the last `cache_control` marker. By putting `cache_control` on the last tool definition and on the system prompt block, both the system prompt and tool schemas get cached in one shot. The tool definitions are static — they never change within a server session. There's no reason to pay for those tokens on every turn.
+
+---
+
+## The database abstraction layer
+
+The system talks to PostgreSQL, MySQL, and DuckDB (for CSV uploads). The naive approach — `if db_type == "postgres": ... elif db_type == "mysql": ...` scattered throughout the codebase — becomes unmaintainable fast. The correct approach is an abstract base class:
+
+```python
+# src/app/connectors/base.py
+class DatabaseConnector(ABC):
+    @abstractmethod
+    async def test_connection(self) -> bool: ...
+
+    @abstractmethod
+    async def introspect_schema(self) -> list[TableInfo]: ...
+
+    @abstractmethod
+    async def execute_query(self, query: str, limit: int = 50) -> str: ...
+
+    @abstractmethod
+    async def disconnect(self) -> None: ...
+```
+
+The `QueryExecutorTool` calls `execute_query`. It doesn't know if it's talking to PostgreSQL or MySQL. The concrete connector handles the dialect differences. When you add support for a new database type — say, BigQuery — you write one new class that implements these four methods. The rest of the system doesn't change.
+
+The `TableInfo` / `ColumnInfo` schema is similarly abstract:
+
+```python
+@dataclass
+class TableInfo:
+    name: str
+    columns: list[ColumnInfo]
+
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str
+```
+
+The `ConnectionService` converts this into schema XML for the prompt. This intermediate representation means the schema XML format is consistent regardless of which database you're connected to.
+
+### DuckDB for CSVs: why it's the right choice
+
+When users upload a CSV, you could: store it in PostgreSQL (requires importing, schema definition, cleanup), use pandas (in-memory, limited SQL, doesn't scale beyond memory), or use DuckDB (in-process analytical SQL engine, native CSV support, full SQL including window functions).
+
+DuckDB is the right answer. It runs in-process, queries CSVs directly without importing, and speaks standard SQL — which means the same query generation logic works for CSVs and live databases. The schema introspection works the same way (just against DuckDB's `information_schema`). The `QueryExecutorTool` routes to DuckDB when there's no `connection_id` in the state:
+
+```python
+if state.connection_id and self.connection_service:
+    return await self._execute_via_connector(...)  # live DB
+return await self._execute_via_duckdb(...)          # CSV
+```
+
+The real limitation: DuckDB state is in-memory per process. On serverless (Vercel), each invocation might get a fresh process. The solution: CSVs are re-registered at request time from stored metadata. A small bit of per-request overhead in exchange for stateless serverless deployment. Worth it.
+
+---
+
+## Security: credentials, keys, and what "defense in depth" actually looks like
+
+Users connect their own databases. The system stores those connection details. Here's how to do this without being reckless.
+
+### Encrypted credential storage
+
+Database passwords are encrypted with Fernet (symmetric authenticated encryption from the `cryptography` library) before being stored:
+
+```python
+# src/app/crypto/
+from cryptography.fernet import Fernet
+
+class FernetCrypto:
+    def __init__(self, key: str):
+        self.fernet = Fernet(key.encode())
+
+    def encrypt(self, data: str) -> str:
+        return self.fernet.encrypt(data.encode()).decode()
+
+    def decrypt(self, token: str) -> str:
+        return self.fernet.decrypt(token.encode()).decode()
+```
+
+The encryption key lives in `FERNET_KEY` — an environment variable that's never written to the database. The encrypted credentials live in the database. If your database is compromised, passwords are unreadable. If your environment variables are compromised, you have bigger problems, but at least you haven't compounded them by storing plaintext credentials too.
+
+Generate a key once:
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Store it in your secrets manager (Vercel environment variables, AWS SSM, whatever you use). Never commit it. The startup code warns you if it's missing in production:
+
+```python
+# src/app/api/lifespan.py
+if not settings.fernet_key and settings.environment == "production":
+    logger.warning("Using ephemeral key. Encrypted data will not survive restarts.")
+```
+
+In development, an ephemeral key is generated automatically. In production, you must provide it explicitly.
+
+Fernet vs bcrypt vs argon2: these solve different problems. bcrypt/argon2 are one-way hashes — you can verify a password but you can't recover it. Fernet is two-way — you can recover the plaintext. You need two-way here because you're literally using these credentials to connect to databases. Use the right tool for the right job.
+
+### API key authentication
+
+Rather than OAuth (complex) or JWTs (requires identity infrastructure), the system uses API keys. This is the right choice for a tool you deploy and use yourself or with a small team. You don't need user accounts with this design.
+
+```python
+# Creation: store hash, return plaintext once
+raw_key = secrets.token_urlsafe(32)
+key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+# store key_hash in DB, return raw_key to user once
+
+# Verification: hash incoming key, compare to stored hash
+incoming_hash = hashlib.sha256(incoming_key.encode()).hexdigest()
+# constant-time comparison against DB record
+```
+
+The key insight: the plaintext key is shown once on creation and never stored. Even if your database is compromised, the attacker gets hashes — useless without the original keys. The SHA-256 hash here is not for password stretching (you'd use bcrypt for that) — it's for preventing timing attacks when comparing the hash directly. The computation is fast enough that timing attacks are the more realistic threat than brute force on a 32-byte random key.
+
+The in-memory TTL cache: verifying a key on every request hits the database. With a cache (TTL ~5 minutes), the first verification hits the DB, subsequent ones are served from memory. A revoked key stays valid for up to 5 minutes — acceptable for most use cases. If you need instant revocation, use Redis as a shared cache across workers.
+
+---
+
+## Production configuration: the unsexy part that breaks everything
+
+### pydantic-settings over os.getenv
+
+Every production AI application I've seen that uses `os.getenv("ANTHROPIC_API_KEY")` directly eventually has a production incident caused by a missing or malformed environment variable. You don't know the variable is wrong until a user request fails.
+
+```python
+# src/app/config/
+class DatabaseConfig(BaseSettings):
+    host: str
+    port: int = 5432
+    user: str
+    password: str
+    schema_name: str = "public"
+    sslmode: str = "require"
+    pool_min_size: int = 0
+    pool_max_size: int = 5
+
+    model_config = SettingsConfigDict(env_prefix="DB__")
+```
+
+With pydantic-settings: if `DB__PORT` is `"abc"`, you get a validation error at startup, not a cryptic psycopg error when the first user connects. If `ANTHROPIC_API_KEY` is missing, you find out when you start the server, not when a user sends a message. The `env_prefix` namespacing (`DB__HOST`, `DB__PORT`, etc.) prevents collisions between configuration for different components. This is boring infrastructure that prevents boring but painful incidents.
+
+### Database initialization: plain SQL over ORM migrations
+
+The `scripts/initialize_db.py` runs DDL files in order:
+
+```
+queries/ddl/
+  create_schema.sql
+  create_api_keys.sql
+  create_connections.sql
+  create_schema_catalog.sql
+  create_query_history.sql
+  create_usage_events.sql
+  create_indexes.sql
+```
+
+The alternative is Alembic. Alembic is powerful — it generates migration scripts, tracks applied migrations, handles rollbacks. For a larger team or a more complex schema with continuous evolution, use it. For this project, plain SQL files are more readable, easier to debug, and sufficient for the use case. The tradeoff: adding a column later requires a manual migration script instead of `alembic revision --autogenerate`. That's fine when you know your schema is relatively stable.
+
+LangGraph's checkpoint tables are also initialized here — `checkpointer.setup()` creates the tables that LangGraph uses to persist graph state. Run `initialize_db.py` before you start the server for the first time.
+
+---
+
+## Deployment: three paths and their honest tradeoffs
+
+### Vercel (serverless)
+
+This is the fastest path to a deployed URL. The backend is a FastAPI app wrapped as a Vercel serverless function:
+
+```
+api/
+  index.py     ← Vercel entry point
+vercel.json    ← rewrite rules
+```
+
+```python
+# api/index.py
+from server import app
+handler = app
+```
+
+```json
+// vercel.json
+{
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }]
+}
+```
+
+Two things people get wrong every time with Vercel Python functions: don't specify a `runtime` in `vercel.json` (Vercel's format changes and this causes cryptic errors — let it auto-detect), and don't use a `functions` block (same reason). Just have `api/index.py` and let Vercel figure it out.
+
+The real tradeoffs with serverless: cold starts (first request after inactivity is slow — add a keep-alive ping if this matters), max execution time (5min on Pro — most queries are fine, but a complex multi-step agent run could hit this), and no shared in-process state (DuckDB state, the in-memory cache). The DuckDB issue is handled by re-registering CSVs at request time. The cache issue means the first request for a given API key always hits the database — acceptable.
+
+Neon is the right hosted PostgreSQL choice for Vercel deployment. It scales to zero (no idle costs), has a serverless-compatible connection pooler, and integrates well. One important gotcha: Neon's pooler doesn't support `search_path` in startup options:
+
+```
+Error: unsupported startup parameter in options: search_path
+```
+
+The fix is to remove `options='-c search_path=...'` from your connection string and use schema-qualified table names (`public.your_table`) instead of relying on `search_path`. The connection config uses `sslmode` directly:
+
+```python
+f"host={host} port={port} dbname={database} "
+f"user={user} password={password} sslmode={sslmode}"
+```
+
+### Docker (self-hosted)
+
+For situations where serverless doesn't work — large CSV uploads (Vercel has a 4.5MB body limit), compliance requirements, persistent connections, or when you need Redis or other services — Docker is the path:
+
+```bash
+# Generate encryption key
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# One-time DB initialization
+docker compose -f docker-compose.prod.yml --profile init up init-db
+
+# Start everything
+docker compose -f docker-compose.prod.yml up -d
+```
+
+The Docker setup uses multi-stage builds (separate build and runtime stages — smaller final image) and non-root containers (a security baseline that costs you nothing to implement). The `init-db` profile runs the initialization script once as a separate container before the main services start, which is the right way to handle database initialization in Compose.
+
+### Which to choose
+
+If you're building a prototype, a personal tool, or a small-team internal tool: Vercel. It's zero ops, you get CI/CD from git push, HTTPS is automatic. If you're building a SaaS product or have data residency requirements: Docker, self-hosted. If you're at a company with a Kubernetes cluster: use that, adapt the Docker setup.
+
+---
+
+## What's intentionally not here
+
+Understanding what was left out tells you as much as what's included.
+
+**No RAG over the schema.** Schema introspection gives the agent the full database structure directly in the prompt. For a database with 20-100 tables, the schema XML fits comfortably in the context window. If you had 5,000 tables, you'd need to retrieve only the relevant subset — retrieval-augmented schema selection. That's a real technique for real problems, just not this one.
+
+**No user authentication.** API keys are the right model for a tool you deploy and use yourself. Adding OAuth, user registration, and session management would roughly double the codebase complexity. If you're building a multi-tenant SaaS, add Auth0 or Clerk. Don't roll your own.
+
+**No fine-tuning.** The combination of good prompting, extended thinking, schema context, and iterative query execution gets accuracy high enough to be useful. Fine-tuning requires a labeled dataset (natural language question, expected SQL pairs) that's specific to your schema, training infrastructure, model versioning, and ongoing evaluation. It's not impossible — it's a significant investment. Prompt engineering gets you 90% of the way there at 5% of the effort. Do that first.
+
+**No write operations.** This is a deliberate product decision, not a limitation. Allowing writes requires user-level permission modeling, transaction management, rollback capabilities, and a completely different safety posture. Read-only is a coherent product — it's a data exploration tool, not a database management tool. The constraint makes the product more trustworthy, not less useful.
+
+---
+
+## The things that will actually bite you
+
+Let me close with the failure modes that aren't obvious until you hit them.
+
+The `Environment` variable collision on macOS. Some macOS shells export an `Environment=` variable (empty string) that overrides your `.env` file, causing pydantic-settings to fail with a validation error about an unexpected value. Fix: `unset Environment` before running the server. Check with `env | grep -i '^environment'`.
+
+The Vercel `X-Accel-Buffering` problem. Already mentioned, worth repeating. If your streaming "works locally but not on Vercel," this header is your first suspect.
+
+The connection pool exhaustion under serverless concurrency. Neon's connection limit is real. Set `DB__POOL_MIN_SIZE=0` (connections released when idle), `DB__POOL_MAX_SIZE=5`, and use Neon's pooler endpoint. If you're getting `PoolTimeout: couldn't get a connection after 30.00 sec`, SSL or connection string issues are preventing any connections from establishing — check for the `search_path` error first.
+
+LangSmith tracing latency. In development, you want LangSmith on — the ability to see every prompt, tool call, and response in the trace UI is invaluable for debugging. In production, be aware that tracing adds per-request latency. Consider sampling (trace 10% of requests) once you're confident in your agent's behavior.
+
+Schema cache invalidation. The schema is cached in `schema_catalog` and served on every request. If a user runs a migration on their database and comes back to ask a question, they might get wrong SQL because the cached schema is stale. The current implementation doesn't have automatic invalidation — it requires an explicit refresh. For most use cases, this is fine: schema migrations are infrequent and users can manually refresh. For a high-reliability product, you'd add a schema version hash comparison.
+
+---
+
+## Starting
+
+```bash
+git clone https://github.com/shreyabaid007/text-to-sql-agent.git
+cd text-to-sql-agent
+
+cp .env.example .env
+# fill in DB credentials and ANTHROPIC_API_KEY
+
+uv sync --all-groups
+cd frontend && npm install && cd ..
+
+uv run python scripts/initialize_db.py
+
+make dev                     # backend: localhost:8000
+cd frontend && npm run dev   # frontend: localhost:3000
+
+# create an API key
+curl -s -X POST http://localhost:8000/v1/api/keys \
+  -H "Content-Type: application/json" \
+  -d '{"name": "dev"}' | python -m json.tool
+
+# paste the key in the sidebar, connect a DB or upload a CSV, start asking
+```
+
+The interesting code to read in order: `src/app/graphs/chat/graph.py` (the graph), `src/app/graphs/chat/nodes/llm.py` (the LLM node), `src/app/tools/db.py` (the tool with sqlglot and HITL), `src/app/api/routers/chat.py` (the SSE endpoint), `prompts/system.jinja2` (the prompt). These five files contain most of the interesting decisions.
+
+The live system is at [text-to-sql-frontend.vercel.app](https://text-to-sql-frontend.vercel.app). Connect your own database or upload a CSV and ask questions about your data. The source is MIT licensed — fork it, extend it, break it, deploy it. That's the point.
+
+---
+
+*Stack: LangGraph 0.5 · FastAPI 0.116 · Claude (claude-sonnet-4-6 / claude-opus-4-6) · Next.js 15 · PostgreSQL · DuckDB · Neon · Vercel · Docker · uv · sqlglot · Fernet · Jinja2 · pydantic-settings · LangSmith*
