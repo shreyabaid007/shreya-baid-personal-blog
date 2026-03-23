@@ -31,7 +31,7 @@ export default async function CategoryPage({ params }: Props) {
   return (
     <div className="max-w-3xl mx-auto px-6 py-12">
       {/* Category header */}
-      <div className="mb-12 animate-fade-up">
+      <div className="mb-8 animate-fade-up">
         <div className="flex items-center gap-2 mb-4">
           <div
             className="w-2 h-2 rounded-full flex-shrink-0"
@@ -45,7 +45,9 @@ export default async function CategoryPage({ params }: Props) {
           </span>
         </div>
         <h1 className="font-display text-3xl font-bold text-ink mb-3">{cat.label}</h1>
-        <p className="text-ink-muted leading-relaxed max-w-lg">{cat.description}</p>
+        {cat.description?.trim() ? (
+          <p className="text-ink-muted leading-relaxed max-w-lg">{cat.description}</p>
+        ) : null}
         <p className="text-xs font-mono text-ink-faint mt-4">
           {posts.length} {posts.length === 1 ? 'post' : 'posts'}
         </p>
