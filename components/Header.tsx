@@ -50,7 +50,7 @@ export default function Header() {
                   : {}
               }
             >
-              {cat.slug === 'ai' ? 'AI' :
+              {cat.slug === 'tech' ? 'Tech' :
                cat.slug === 'climate' ? 'Climate' :
                cat.slug === 'security' ? 'Security' :
                cat.slug === 'philosophy' ? 'Philosophy' :
