@@ -23,17 +23,6 @@ export default function Header() {
         </div>
 
         <nav className="flex items-center gap-1 pb-3 overflow-x-auto no-scrollbar">
-          <Link
-            href="/"
-            className={clsx(
-              'tag flex-shrink-0',
-              pathname === '/'
-                ? 'bg-ink text-paper border-ink'
-                : 'bg-transparent text-ink-muted border-paper-border hover:border-ink-faint hover:text-ink-soft'
-            )}
-          >
-            All
-          </Link>
           {Object.entries(CATEGORIES).map(([categoryKey, cat]) => (
             <Link
               key={categoryKey}
