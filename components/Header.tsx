@@ -34,26 +34,26 @@ export default function Header() {
           >
             All
           </Link>
-          {Object.values(CATEGORIES).map((cat) => (
+          {Object.entries(CATEGORIES).map(([categoryKey, cat]) => (
             <Link
-              key={cat.slug}
-              href={`/${cat.slug}`}
+              key={categoryKey}
+              href={`/${categoryKey}`}
               className={clsx(
                 'tag flex-shrink-0',
-                currentCategory === cat.slug
+                currentCategory === categoryKey
                   ? 'text-paper border-transparent'
                   : 'bg-transparent text-ink-muted border-paper-border hover:border-ink-faint hover:text-ink-soft'
               )}
               style={
-                currentCategory === cat.slug
+                currentCategory === categoryKey
                   ? { backgroundColor: cat.accent, borderColor: cat.accent }
                   : {}
               }
             >
-              {cat.slug === 'tech' ? 'Tech' :
-               cat.slug === 'climate' ? 'Climate' :
-               cat.slug === 'security' ? 'Security' :
-               cat.slug === 'philosophy' ? 'Philosophy' :
+              {categoryKey === 'tech' ? 'Tech' :
+               categoryKey === 'climate' ? 'Climate' :
+               categoryKey === 'security' ? 'Security' :
+               categoryKey === 'philosophy' ? 'Philosophy' :
                'Notes'}
             </Link>
           ))}
