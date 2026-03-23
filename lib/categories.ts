@@ -8,8 +8,8 @@ export interface Category {
 
 export const CATEGORIES: Record<string, Category> = {
   ai: {
-    slug: 'ai',
-    label: 'AI & Machine Learning',
+    slug: 'Tech',
+    label: 'Technology, Systems & AI',
     description: '',
     accent: '#5C3D11',
     accentPale: '#F7F0E6',
