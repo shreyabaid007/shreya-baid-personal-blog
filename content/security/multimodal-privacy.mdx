@@ -1,0 +1,154 @@
+---
+title: "Building GDPR-Compliant AI Models"
+description: "Anonymity, Pseudonymisation & Privacy by Design — What the EDPB's 2024–2025 guidelines actually require from AI developers"
+date: "2025-01-16"
+tags: ["GDPR", "AICompliance", "Pseudonymisation"]
+draft: false
+---
+
+# Embedding Privacy by Design in Multimodal AI Development
+
+Multimodal AI systems — models that process text, images, audio, and video together — handle far more personal data than single-input models. A user's voice, face, and typed query can all be processed in a single interaction. That broader data surface makes GDPR compliance harder, and the stakes of getting it wrong significantly higher.
+
+The European Data Protection Board (EDPB) published two key documents in late 2024 and early 2025 that directly address this: **Opinion 28/2024 on AI Models** and **Guidelines 01/2025 on Pseudonymisation**. This article breaks down what they require, and what AI developers actually need to do.
+
+---
+
+## 1. What the EDPB Guidelines Cover
+
+### 1.1 The EDPB's Role in AI Regulation
+
+The EDPB enforces GDPR principles as AI technology evolves. Rather than slowing innovation, its guidelines are meant to create a clear legal path — so developers know what's permissible, what requires justification, and what isn't allowed at all.
+
+Opinion 28/2024 specifically addresses three questions that came directly from the Irish supervisory authority:
+
+1. When can an AI model be considered **anonymous**?
+2. How can controllers justify **legitimate interest** as a legal basis during development?
+3. What happens when personal data is **unlawfully processed** during training — does it taint the deployed model?
+
+### 1.2 Key Concepts at a Glance
+
+| Concept | What It Means |
+|--------|----------------|
+| **Pseudonymisation** | Replaces identifiers with pseudonyms — data stays useful but less exposed. Still personal data under GDPR. |
+| **Anonymisation** | Permanently removes all identifiability — GDPR no longer applies if done correctly. |
+| **Privacy by Design** | Data protection built into the system from day one, not bolted on after. |
+| **Privacy by Default** | Systems process only the minimum data necessary, by default, without user action. |
+
+---
+
+## 2. Privacy by Design in AI Development
+
+### 2.1 Data Collection and Preparation
+
+Before any model is trained, the data pipeline itself needs to be GDPR-compliant. That means:
+
+- **Data Minimisation** — Only collect what the model genuinely needs. If a multimodal model doesn't need real faces to function, don't train it on them.
+- **Transparency** — Users must be told how their data is being used, in plain terms.
+- **Meaningful Consent** — Consent must be a real choice, not buried in terms of service.
+
+### 2.2 Privacy-Preserving Techniques
+
+These are the technical tools the EDPB recognises as effective during model development:
+
+| Technique | How It Helps |
+|-----------|-------------|
+| **Pseudonymisation** | Masks identities in training data while keeping it analytically useful |
+| **Synthetic Data Generation** | Generates artificial data that mirrors real patterns — no actual individuals involved |
+| **Differential Privacy** | Adds calibrated statistical noise so individual data points can't be extracted |
+
+### 2.3 Risk Assessment — The DPIA
+
+A **Data Protection Impact Assessment (DPIA)** is not optional for high-risk AI processing — it's required. It should identify:
+
+- Risk of **data linkage** — where combining datasets re-identifies individuals
+- Risk of **unauthorised access** during training or storage
+- Gaps in **encryption and access controls**
+
+The DPIA should be a living document, revisited as the model evolves — not a one-time checkbox.
+
+---
+
+## 3. When Can an AI Model Itself Be Considered Anonymous?
+
+This is one of the most practically important questions Opinion 28/2024 addresses — and the answer is more cautious than many developers expect.
+
+The EDPB states that **AI models trained on personal data cannot automatically be assumed anonymous**. For a model to be considered anonymous, both of the following conditions must be met:
+
+1. The likelihood of **directly extracting personal data** from the model — including through probabilistic methods — must be insignificant.
+2. The likelihood of **obtaining personal data through queries** — intentionally or not — must also be insignificant.
+
+This matters practically: a language model that was trained on personal data could still reproduce or leak that data through its outputs. The EDPB expects controllers to actively demonstrate anonymity — through documentation, technical testing, and resistance to known extraction attacks — not simply assert it.
+
+---
+
+## 4. Privacy by Design in AI Deployment
+
+### 4.1 Transparency and Accountability
+
+Once a model is deployed, GDPR obligations don't stop. Controllers must:
+
+- Keep detailed **records of data processing activities**
+- Ensure the AI is **explainable** — users affected by AI decisions should be able to understand why
+- Maintain clear **accountability** — someone is always responsible for data governance
+
+### 4.2 Data Subject Rights
+
+AI systems must be built to support these rights technically, not just acknowledge them in policy:
+
+| Right | What the System Must Support |
+|-------|------------------------------|
+| **Access & Correction** | Users can view and amend their data |
+| **Erasure & Portability** | Users can delete their data or export it |
+| **Consent Withdrawal** | Users can withdraw consent simply, without friction |
+
+---
+
+## 5. The Three Core Techniques for Multimodal AI
+
+### 5.1 Anonymisation
+
+True anonymisation means an individual cannot be **singled out**, **linked across datasets**, or **inferred** — even when the anonymised data is combined with external information.
+
+If those conditions are genuinely met, the data falls outside GDPR's scope entirely, which significantly simplifies lawful processing. The catch: the EDPB holds this to a high standard, and the burden of proof sits with the controller.
+
+---
+
+### 5.2 Pseudonymisation
+
+Pseudonymisation replaces direct identifiers with pseudonyms. The original data can still be recovered using separately stored additional information — which is why it remains personal data under GDPR.
+
+> ⚠️ Pseudonymised data still requires a valid legal basis, transparency obligations, and data protection compliance — it doesn't reduce your GDPR obligations, it reduces your risk exposure.
+
+Per Guidelines 01/2025, pseudonymisation is most effective when the **pseudonymisation domain** is tightly defined — meaning only authorised recipients with a specific purpose can access the additional information needed to re-link the data. The broader that circle, the weaker the protection.
+
+---
+
+### 5.3 Synthetic Data
+
+Synthetic data is generated to replicate the **statistical patterns** of real data, without representing any actual individual. For multimodal AI, this is especially valuable — synthetic faces, synthetic voices, and synthetic text can stand in for real training data.
+
+The EDPB requires a **Privacy Assurance Assessment** before relying on synthetic data, to confirm:
+- The data cannot be used to re-identify real individuals
+- No traces of personal data from the original dataset persist in the synthetic output
+
+---
+
+## Summary: Techniques at a Glance
+
+| Technique | GDPR Applies? | Re-ID Risk | Best Used For |
+|-----------|--------------|------------|---------------|
+| **Anonymisation** | No (if correctly done) | None | Data sharing, open datasets |
+| **Pseudonymisation** | Yes | Controlled | Model development, internal processing |
+| **Synthetic Data** | Depends on method | Low (if validated) | AI training, testing pipelines |
+| **Differential Privacy** | Yes | Very low | Statistical analysis, ML training |
+
+---
+
+## References
+
+1. EDPB Opinion 28/2024 — *Certain data protection aspects related to the processing of personal data in the context of AI models* (17 December 2024)
+   [→ Read the full opinion](https://www.edpb.europa.eu/system/files/2024-12/edpb_opinion_202428_ai-models_en.pdf)
+
+2. EDPB Guidelines 01/2025 — *Pseudonymisation* (16 January 2025)
+   [→ Read the full guidelines](https://www.edpb.europa.eu/system/files/2025-01/edpb_guidelines_202501_pseudonymisation_en.pdf)
