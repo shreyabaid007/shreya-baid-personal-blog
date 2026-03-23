@@ -7,7 +7,7 @@ export interface Category {
 }
 
 export const CATEGORIES: Record<string, Category> = {
-  ai: {
+  tech: {
     slug: 'Tech',
     label: 'Technology, Systems & AI',
     description: '',
