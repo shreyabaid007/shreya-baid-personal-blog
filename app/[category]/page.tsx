@@ -53,8 +53,6 @@ export default async function CategoryPage({ params }: Props) {
         </p>
       </div>
 
-      <hr className="divider" />
-
       {posts.length === 0 ? (
         <div className="py-16 text-center">
           <p className="text-ink-muted font-mono text-sm">Nothing published yet.</p>
